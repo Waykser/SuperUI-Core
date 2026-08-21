@@ -67,6 +67,178 @@ void AiBotAI::OnPlayerLogin()
 
         // Persist character to DB so it survives restarts
         me->SaveToDB();
+
+    if (m_companion)
+    {
+        // [SUI] Initialise a companion HERE, and mark it initialised, so UpdateAI's
+        // first-tick block is never reached for it. That block is fabricated-bot login
+        // work — UpdateSkillsToMaxSkillsForLevel, AddAllSpellReagents, SummonPetIfNeeded,
+        // a full heal — and every one of those is vandalism on a character its owner
+        // actually plays: maxed weapon skills they never trained, free reagents in their
+        // bags, a topped-up health bar. Same reasoning, same sequence, as
+        // AttachToRealCharacter; only the AI-internal pieces UpdateAI genuinely needs.
+        if (m_role == ROLE_INVALID)
+            AutoAssignRole();
+        ResetSpellData();
+        PopulateSpellData();
+        m_freshSpawn = false;
+        m_initialized = true;
+        m_lastKnownLevel = me->GetLevel();
+        me->RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SPAWNING);
+
+        // Join the owner's party now that the body is in world. The enrol command runs
+        // while this character is still offline, so it could only record WHO to join;
+        // this is the first moment a group operation is legal. Joining is what arms the
+        // reflexes — ResolveDoctrine picks PlayerParty (assist, defend, never initiate)
+        // the moment a real player shares the group.
+        if (!m_companionOwnerGuid.IsEmpty())
+        {
+            ObjectGuid ownerGuid = m_companionOwnerGuid;
+            m_companionOwnerGuid.Clear();   // one-shot; re-inviting later is the owner's business
+            JoinOwnerGroup(ownerGuid);
+        }
+    }
+}
+
+// [SUI] Ordered cast that only missed on geometry: remember it, and let the tick retry
+// while the member closes the distance. Arming replaces whatever was pending — the last
+// order wins, which is what a hotbar press means.
+void AiBotAI::ArmPendingCast(uint32 spellId, ObjectGuid targetGuid, ObjectGuid commanderGuid,
+    uint32 budgetMs)
+{
+    m_pendingCast.spellId       = spellId;
+    m_pendingCast.targetGuid    = targetGuid;
+    m_pendingCast.commanderGuid = commanderGuid;
+    m_pendingCast.msLeft        = budgetMs;
+}
+
+void AiBotAI::UpdatePendingCast(uint32 diff)
+{
+    if (!m_pendingCast.spellId)
+        return;
+
+    // Anything that invalidates the attempt drops the order rather than retrying blindly.
+    if (!me || !me->IsInWorld() || !me->IsAlive() || me->IsBeingTeleported())
+    {
+        ClearPendingCast();
+        return;
+    }
+
+    // A human took the body: they are casting by hand now, and a queued order firing
+    // under their fingers is exactly the mid-fight surprise possession exists to avoid.
+    // Commanding from the free view is the usual exception — there the order IS the
+    // only input the body gets.
+    if (m_possessed && !SuiPossess::IsCommandedFromFreeView(me))
+    {
+        ClearPendingCast();
+        return;
+    }
+
+    if (m_pendingCast.msLeft <= diff)
+    {
+        // Budget spent. Say so — a silently abandoned order is worse than a failed one,
+        // because the owner has no way to tell it from a button that never registered.
+        Player* commander = sObjectMgr.GetPlayer(m_pendingCast.commanderGuid);
+        uint32 const spellId = m_pendingCast.spellId;
+        ClearPendingCast();
+        if (commander && commander->GetSession())
+            ChatHandler(commander).PSendSysMessage(
+                "[SUI] %s: could not reach the target in time (spell %u).",
+                me->GetName(), spellId);
+        return;
+    }
+    m_pendingCast.msLeft -= diff;
+
+    // Don't interrupt a cast already under way — including the one this order started.
+    if (me->IsNonMeleeSpellCasted(false, false, true))
+        return;
+
+    Unit* target = me->GetMap()->GetUnit(m_pendingCast.targetGuid);
+    if (!target || !target->IsInWorld() || !target->IsAlive())
+    {
+        ClearPendingCast();
+        return;
+    }
+
+    me->SetFacingToObject(target);
+    SpellCastResult result = me->CastSpell(target, m_pendingCast.spellId, false);
+
+    if (result == SPELL_CAST_OK)
+    {
+        ClearPendingCast();
+        return;
+    }
+
+    // Still closing: keep the order alive and keep walking.
+    if (result == SPELL_FAILED_OUT_OF_RANGE || result == SPELL_FAILED_LINE_OF_SIGHT)
+        return;
+
+    // Some OTHER reason now — the member got in range and hit a real wall (no mana, the
+    // GCD, an immunity). Report that reason, not the stale positional one.
+    Player* commander = sObjectMgr.GetPlayer(m_pendingCast.commanderGuid);
+    uint32 const spellId = m_pendingCast.spellId;
+    ClearPendingCast();
+    if (commander && commander->GetSession())
+    {
+        if (char const* text = SuiPossess::CastResultText(result))
+            ChatHandler(commander).PSendSysMessage("[SUI] %s: %s (spell %u)",
+                me->GetName(), text, spellId);
+        else
+            ChatHandler(commander).PSendSysMessage("[SUI] %s: cast failed, code %u (spell %u)",
+                me->GetName(), uint32(result), spellId);
+    }
+}
+
+// [SUI] Put this companion in its owner's party, creating the party if the owner is
+// solo. Mirrors PartyBotAI::AddToPlayerGroup — the same three cases (owner ungrouped /
+// owner grouped / group full), with the companion leaving any stale group first.
+bool AiBotAI::JoinOwnerGroup(ObjectGuid ownerGuid)
+{
+    Player* owner = sObjectMgr.GetPlayer(ownerGuid);
+    if (!owner || !owner->IsInWorld() || !me || !me->IsInWorld())
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+            "[AIBOT-COMPANION] %s: owner not in world, staying ungrouped",
+            me ? me->GetName() : "?");
+        return false;
+    }
+
+    if (me->GetGroup())
+        me->RemoveFromGroup();
+
+    Group* group = owner->GetGroup();
+    if (!group)
+    {
+        group = new Group();
+        if (!group->Create(owner->GetObjectGuid(), owner->GetName()))
+        {
+            delete group;
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                "[AIBOT-COMPANION] %s: could not create a group for %s",
+                me->GetName(), owner->GetName());
+            return false;
+        }
+        sObjectMgr.AddGroup(group);
+    }
+    else if (group->IsFull())
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+            "[AIBOT-COMPANION] %s: %s's group is full",
+            me->GetName(), owner->GetName());
+        return false;
+    }
+
+    if (!group->AddMember(me->GetObjectGuid(), me->GetName()))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+            "[AIBOT-COMPANION] %s: AddMember to %s's group failed",
+            me->GetName(), owner->GetName());
+        return false;
+    }
+
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
+        "[AIBOT-COMPANION] %s joined %s's party", me->GetName(), owner->GetName());
+    return true;
 }
 
 // [SUI] Ctrl+RightClick waypoint chain. An idle bot starts the first leg right
@@ -129,22 +301,30 @@ bool AiBotAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)
 
     if (result)
     {
-        // [SUI] HARD WALL: never adopt a character owned by a REAL account. The
-        // brain auto-register once swallowed an enrolled real character
+        // [SUI] HARD WALL: a session may only adopt a character its own account
+        // owns. The brain auto-register once swallowed an enrolled real character
         // (Tesfff, 2026-08-10); logging it in on a synthetic bot account lets
         // SaveToDB stamp that account over the owner and the character
-        // vanishes from their account list. Whatever a registry row says, a
-        // real-account character is refused here.
+        // vanishes from their account list.
+        //
+        // The test is account IDENTITY, not "is the owner real" (2026-08-20,
+        // companions). That original shape refused every real-account character
+        // outright, which also blocked the legitimate companion path: AddBot
+        // resolves the session account with GetPlayerAccountIdByGUID
+        // (PlayerBotMgr.cpp), i.e. the character's OWN account, so nothing can be
+        // stamped over. Identity is strictly the stronger guard — it still refuses
+        // a synthetic account adopting a real character (the original bug), and it
+        // additionally refuses a synthetic account adopting some OTHER fabricated
+        // bot's row, which the realmd-existence test let through.
         if (auto acctResult = CharacterDatabase.PQuery(
                 "SELECT `account` FROM `characters` WHERE `guid` = '%u'", entry->playerGUID))
         {
             uint32 ownerAccount = acctResult->Fetch()[0].GetUInt32();
-            if (LoginDatabase.PQuery(
-                    "SELECT 1 FROM `account` WHERE `id` = '%u'", ownerAccount))
+            if (ownerAccount != sess->GetAccountId())
             {
                 sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
-                    "[AIBOT] REFUSING to spawn guid %u as a bot: character belongs to REAL account %u",
-                    entry->playerGUID, ownerAccount);
+                    "[AIBOT] REFUSING to spawn guid %u as a bot: character belongs to account %u, session is account %u",
+                    entry->playerGUID, ownerAccount, sess->GetAccountId());
                 return false;
             }
         }
@@ -1009,6 +1189,12 @@ void AiBotAI::UpdateAI(uint32 const diff)
     if (!m_possessed)
         UpdateMovementTrace(diff);
 
+    // [SUI] Ordered-cast retry. Sits with the sub-ticks above, and for the same reason:
+    // an order that failed only on range or LOS is being walked into position right now,
+    // and re-testing it at 1 Hz would spend most of the budget standing in range doing
+    // nothing. Runs at the full tick rate; it is a couple of compares when unarmed.
+    UpdatePendingCast(diff);
+
     m_updateTimer.Update(diff);
     if (m_updateTimer.Passed())
         m_updateTimer.Reset(AIBOT_UPDATE_INTERVAL);
@@ -1270,9 +1456,17 @@ void AiBotAI::UpdateAI(uint32 const diff)
         SendLevelUpEvent(me->GetLevel());
         m_lastKnownLevel = me->GetLevel();
 
-        // Re-learn spells and update skills for new level
+        // Re-learn spells for the new level. PopulateSpellData is AI-internal — it only
+        // rebuilds the rotation's view of what this body can cast — so it runs for everyone.
         PopulateSpellData();
-        me->UpdateSkillsToMaxSkillsForLevel();
+
+        // Skill-maxing is a CHARACTER mutation and must not touch a companion (2026-08-20).
+        // The login path already excludes it for exactly this reason (see the companion block
+        // in OnPlayerLogin); without this gate the same vandalism simply arrives one ding
+        // later, handing the owner's character weapon and defense skills it never trained.
+        // A fabricated bot still gets it — it has no training history to falsify.
+        if (!m_companion)
+            me->UpdateSkillsToMaxSkillsForLevel();
     }
 
     // --- Auto-loot timer ---

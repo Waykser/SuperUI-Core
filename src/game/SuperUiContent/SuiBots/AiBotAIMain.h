@@ -443,6 +443,36 @@ public:
     bool IsPossessed() const { return m_possessed; }
     void UpdateBridgeTick();   // bridge connect/recv/state/flush, shared by both tick paths
 
+    // [SUI] Companion: one of the OWNER'S OWN characters, logged in headless on its own
+    // account and commanded by them (.sui companion add). Unlike m_possessed this is
+    // durable for the whole session, and it does NOT suspend the AI — a companion keeps
+    // its reflexes (the PlayerParty escort doctrine selects itself the moment a real
+    // player is in the group: assist, defend, run the rotation, never initiate). What it
+    // changes is AUTHORSHIP: STATE carries companion:1 so the C# brain never plans for
+    // it, and no strategic bridge command may retask it. Owner orders still apply.
+    void SetCompanion(bool on) { m_companion = on; }
+    bool IsCompanion() const { return m_companion; }
+    // Recorded at enrol time (the character is still offline then) and consumed once by
+    // OnPlayerLogin, the first moment a group operation is legal for this body.
+    void SetCompanionOwner(ObjectGuid owner) { m_companionOwnerGuid = owner; }
+    bool JoinOwnerGroup(ObjectGuid ownerGuid);
+
+    // [SUI] Ordered cast (SuiPossess::OrderCast). An order that CheckCast refused only
+    // because of distance or line of sight is not a failure yet — the member walks in and
+    // retries until the budget runs out. Anything else (no mana, on cooldown, immune) is
+    // final and is reported to the commander immediately. Any new order clears it.
+    struct PendingCast
+    {
+        uint32     spellId = 0;
+        ObjectGuid targetGuid;
+        ObjectGuid commanderGuid;   // who to answer; the member has no socket of its own
+        uint32     msLeft = 0;
+    };
+    void ArmPendingCast(uint32 spellId, ObjectGuid targetGuid, ObjectGuid commanderGuid, uint32 budgetMs);
+    void ClearPendingCast() { m_pendingCast = PendingCast(); }
+    bool HasPendingCast() const { return m_pendingCast.spellId != 0; }
+    void UpdatePendingCast(uint32 diff);
+
     // [SUI] RTS waypoint chain (Ctrl+RightClick in the free view). ORDER_MOVE_QUEUE
     // appends; arrival chains into the next leg; ORDER_MOVE / ORDER_STOP clear it.
     void SuiQueueWaypoint(float x, float y, float z);
@@ -614,7 +644,13 @@ public:
     void BridgeSendState();
     void BridgeSendEvent(const char* eventType, const char* data);
     void BridgeRecv();
-    void BridgeProcessLine(const char* line);
+    // fromBrain distinguishes a line that arrived on the TCP socket (the C# strategic
+    // layer) from one synthesised locally to actuate an OWNER order — SuiPossess RTS
+    // orders and the waypoint chain both reuse these handlers verbatim so ordered
+    // behaviour is bit-identical to brain-issued behaviour. Only the socket path is
+    // subject to the possessed/companion authorship walls, so the default is false:
+    // a new local caller is un-gated unless it opts in.
+    void BridgeProcessLine(const char* line, bool fromBrain = false);
     void BridgeHandleMoveTo(const char* json);
     void BridgeHandleTeleport(const char* json);   // generic live-bot teleport (assist + future hearth)
     void MoveToDestination(float destX, float destY, float destZ, bool stopCurrentMovement = true);
@@ -711,6 +747,9 @@ public:
     bool m_loggedFirstUpdate = false;
     bool m_freshSpawn = false;
     bool m_possessed = false;         // SUI possession: autonomous behaviour suspended
+    bool m_companion = false;         // one of the owner's own characters (.sui companion add)
+    ObjectGuid m_companionOwnerGuid;  // pending party to join at login (one-shot)
+    PendingCast m_pendingCast;        // ordered cast awaiting range/LOS (SuiPossess::OrderCast)
     // Set by AttachToRealCharacter: inert PlayerBotEntry (never registered with
     // PlayerBotMgr) absorbing the base class's requestRemoval writes.
     std::unique_ptr<PlayerBotEntry> m_ownedDummyEntry;

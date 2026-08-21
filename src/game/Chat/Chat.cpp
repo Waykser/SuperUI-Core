@@ -92,12 +92,26 @@ ChatCommand * ChatHandler::getCommandTable()
         { nullptr,      0,                      false, nullptr,                                        "", nullptr },
     };
 
+    // [SUI] Companions: the owner's own characters, run headless alongside them.
+    static ChatCommand suiCompanionCommandTable[] =
+    {
+        { "add",        SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiCompanionAddCommand,     "", nullptr },
+        { "remove",     SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiCompanionRemoveCommand,  "", nullptr },
+        { "list",       SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiCompanionListCommand,    "", nullptr },
+        { "talent",     SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiCompanionTalentCommand,  "", nullptr },
+        { "untalent",   SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiCompanionUntalentCommand,"", nullptr },
+        { nullptr,      0,                      false, nullptr,                                        "", nullptr },
+    };
+
     static ChatCommand suiCommandTable[] =
     {
         { "possess",    SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiPossessCommand,          "", nullptr },
         { "release",    SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiReleaseCommand,          "", nullptr },
         { "worldstate", SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiWorldStateCommand,       "", nullptr },
         { "rts",        SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiRtsCommand,              "", nullptr },
+        { "companion",  SEC_ADMINISTRATOR,      false, nullptr,                                        "", suiCompanionCommandTable },
+        { "cast",       SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiCastCommand,             "", nullptr },
+        { "order",      SEC_ADMINISTRATOR,      false, &ChatHandler::HandleSuiOrderCommand,            "", nullptr },
         { nullptr,      0,                      false, nullptr,                                        "", nullptr },
     };
 
@@ -3342,6 +3356,41 @@ static char const* const spellKeys[] =
     "Henchant",                                             // enchanting recipe spell
     nullptr
 };
+
+// [SUI] The TALENT id behind a shift-clicked talent, or a bare number.
+//
+// ExtractSpellIdFromLink resolves the same link but returns RankID[rank] — the SPELL for one
+// rank — which is what .learn wants and what Player::LearnTalent cannot use: that takes
+// (talentId, rank). Hence a sibling rather than a caller.
+//
+// The link's own rank field is deliberately discarded. It encodes the CURRENT rank, with -1
+// for unlearned (see the SPELL_LINK_TALENT branch below), so turning it into "the rank to
+// learn next" is an off-by-one that changes meaning depending on whether the talent is
+// untrained. The caller derives the next rank from the target's own spellbook instead, which
+// is unambiguous and stays correct no matter whose tree the link was clicked in.
+bool ChatHandler::ExtractTalentFromLink(char** text, uint32& talentId)
+{
+    int type;
+    char* param1_str = nullptr;
+    char* idS = ExtractKeyFromLink(text, spellKeys, &type, &param1_str);
+    if (!idS)
+        return false;
+
+    uint32 id;
+    if (!ExtractUInt32(&idS, id))
+        return false;
+
+    // A bare number is taken as a talent id; an Htalent link carries one directly. An Hspell
+    // or Henchant link is a spell, not a talent, and is refused rather than misread.
+    if (type != SPELL_LINK_RAW && type != SPELL_LINK_TALENT)
+        return false;
+
+    if (!sTalentStore.LookupEntry(id))
+        return false;
+
+    talentId = id;
+    return true;
+}
 
 uint32 ChatHandler::ExtractSpellIdFromLink(char** text)
 {

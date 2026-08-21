@@ -39,11 +39,16 @@ struct PlayerBotEntry
     bool isChatBot; // bot des joueurs en discussion via le site.
     bool customBot; // Enabled even if PlayerBot system disabled (AutoTesting system for example)
     bool requestRemoval;
+    // [SUI] A companion is one of the OWNER'S OWN characters, logged in headless on
+    // its own account and commanded by them (.sui companion add). It is not a
+    // fabricated bot: its levels, loot and quest progress are real progression, so
+    // it saves unconditionally -- see IsSavingAllowed(entry).
+    bool isCompanion;
     std::unique_ptr<PlayerBotAI> ai;
 
-    PlayerBotEntry(uint64 guid, uint32 account, uint32 chance_): playerGUID(guid), accountId(account), chance(chance_), state(PB_STATE_OFFLINE), isChatBot(false), customBot(false), requestRemoval(false), ai(nullptr)
+    PlayerBotEntry(uint64 guid, uint32 account, uint32 chance_): playerGUID(guid), accountId(account), chance(chance_), state(PB_STATE_OFFLINE), isChatBot(false), customBot(false), requestRemoval(false), isCompanion(false), ai(nullptr)
     {}
-    PlayerBotEntry(): playerGUID(0), accountId(0), chance(100.0f), state(PB_STATE_OFFLINE), isChatBot(false), customBot(false), requestRemoval(false), ai(nullptr)
+    PlayerBotEntry(): playerGUID(0), accountId(0), chance(100.0f), state(PB_STATE_OFFLINE), isChatBot(false), customBot(false), requestRemoval(false), isCompanion(false), ai(nullptr)
     {}
 };
 
@@ -80,7 +85,11 @@ class PlayerBotMgr
         bool AddOrRemoveBot();
 
         bool AddBot(PlayerBotAI* ai);
-        bool AddBot(uint32 playerGuid, bool chatBot = false, PlayerBotAI* pAI = nullptr);
+        bool AddBot(uint32 playerGuid, bool chatBot = false, PlayerBotAI* pAI = nullptr, bool companion = false);
+
+        // [SUI] Companion lookups for the .sui companion command family.
+        PlayerBotEntry* GetBotEntry(uint32 playerGuid);
+        void GetCompanions(std::vector<PlayerBotEntry*>& out);
         bool DeleteBot(std::map<uint64, std::shared_ptr<PlayerBotEntry>>::iterator iter);
         bool DeleteBot(uint32 playerGuid);
 
@@ -103,6 +112,16 @@ class PlayerBotMgr
         bool IsPermanentBot(uint32 playerGuid);
         bool IsChatBot(uint32 playerGuid);
         bool IsSavingAllowed() { return m_confAllowSaving; }
+        // [SUI] Per-entry saving (2026-08-20). PlayerBot.AllowSaving defaults to FALSE
+        // because a large fabricated fleet has nothing worth persisting and saving it
+        // every tick is pure I/O. A companion is the opposite case -- it is the owner's
+        // real character, and dropping its session without a save silently discards a
+        // whole play session's XP, loot and quest progress. Companions therefore save
+        // regardless of the global flag; everything else still obeys it.
+        bool IsSavingAllowed(PlayerBotEntry const* entry)
+        {
+            return (entry && entry->isCompanion) || m_confAllowSaving;
+        }
 
         uint32 GenBotAccountId() { return ++m_maxAccountId; }
         PlayerBotStats& GetStats(){ return m_stats; }

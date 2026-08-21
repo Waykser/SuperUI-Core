@@ -281,6 +281,13 @@ class ChatHandler
         bool HandleSuiReleaseCommand(char* args);
         bool HandleSuiWorldStateCommand(char* args);
         bool HandleSuiRtsCommand(char* args);
+        bool HandleSuiCompanionAddCommand(char* args);
+        bool HandleSuiCompanionRemoveCommand(char* args);
+        bool HandleSuiCompanionListCommand(char* args);
+        bool HandleSuiCastCommand(char* args);
+        bool HandleSuiOrderCommand(char* args);
+        bool HandleSuiCompanionTalentCommand(char* args);
+        bool HandleSuiCompanionUntalentCommand(char* args);
         bool PartyBotAddRequirementCheck(Player const* pPlayer, Player const* pTarget);
         bool HandlePartyBotAddCommand(char * args);
         bool HandlePartyBotCloneCommand(char * args);
@@ -1089,6 +1096,9 @@ class ChatHandler
 
         uint32 ExtractAccountId(char** args, std::string* accountName = nullptr, Player** targetIfNullArg = nullptr);
         uint32 ExtractSpellIdFromLink(char** text);
+        // [SUI] The talent id behind a shift-clicked talent link or a bare number. Sibling of
+        // ExtractSpellIdFromLink, which resolves the same link to a rank's SPELL id instead.
+        bool ExtractTalentFromLink(char** text, uint32& talentId);
         ObjectGuid ExtractGuidFromLink(char** text);
         GameTele const* ExtractGameTeleFromLink(char** text);
         bool   ExtractLocationFromLink(char** text, uint32& mapid, float& x, float& y, float& z);

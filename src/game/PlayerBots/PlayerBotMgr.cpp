@@ -253,7 +253,7 @@ void PlayerBotMgr::Update(uint32 diff)
                 DeleteBot(iter);
 
                 if (WorldSession* sess = sWorld.FindSession(iter->second->accountId))
-                    sess->LogoutPlayer(m_confAllowSaving);
+                    sess->LogoutPlayer(IsSavingAllowed(iter->second.get()));
 
                 iter->second->requestRemoval = false;
 
@@ -409,7 +409,7 @@ bool PlayerBotMgr::AddBot(PlayerBotAI* ai)
     return AddBot(e->playerGUID, false);
 }
 
-bool PlayerBotMgr::AddBot(uint32 playerGUID, bool chatBot, PlayerBotAI* pAI)
+bool PlayerBotMgr::AddBot(uint32 playerGUID, bool chatBot, PlayerBotAI* pAI, bool companion)
 {
     uint32 accountId = 0;
     auto iter = m_bots.find(playerGUID);
@@ -493,6 +493,13 @@ bool PlayerBotMgr::AddBot(uint32 playerGUID, bool chatBot, PlayerBotAI* pAI)
         }
     }
 
+    // [SUI] Stamp companion BEFORE the session exists. HandlePlayerLogin reads
+    // IsSavingAllowed(entry) to decide m_saveDisabled for the whole session, so a
+    // flag set after AddBot returns would be a race against the login this call
+    // sets in motion — and losing that race silently discards the character's
+    // progress, which is the exact failure this flag exists to prevent.
+    e->isCompanion = companion;
+
     e->ai->botEntry = e.get();
     e->state = PB_STATE_LOADING;
     WorldSession* session = new WorldSession(accountId, nullptr, sAccountMgr.GetSecurity(accountId), 0, LOCALE_enUS);
@@ -503,6 +510,19 @@ bool PlayerBotMgr::AddBot(uint32 playerGUID, bool chatBot, PlayerBotAI* pAI)
         AddTempBot(accountId, 20000);
 
     return true;
+}
+
+PlayerBotEntry* PlayerBotMgr::GetBotEntry(uint32 playerGuid)
+{
+    auto iter = m_bots.find(uint64(playerGuid));
+    return iter == m_bots.end() ? nullptr : iter->second.get();
+}
+
+void PlayerBotMgr::GetCompanions(std::vector<PlayerBotEntry*>& out)
+{
+    for (auto const& itr : m_bots)
+        if (itr.second->isCompanion && itr.second->state != PB_STATE_OFFLINE)
+            out.push_back(itr.second.get());
 }
 
 bool PlayerBotMgr::AddRandomBot()

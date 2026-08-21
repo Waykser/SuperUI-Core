@@ -20,7 +20,10 @@
 #include "ObjectMgr.h"
 #include "Objects/Player.h"
 #include "PlayerBotMgr.h"
+#include "Database/DBCStores.h"   // sTalentStore / sTalentTabStore — .sui companion talent
 #include "Server/WorldSession.h"
+#include "Spell.h"        // SpellCastResult + the SPELL_FAILED_* codes ordered casts report
+#include "SpellMgr.h"     // sSpellMgr.GetSpellEntry — reject a spell id that does not exist
 #include "SuiFactionControl.h"
 #include "SuperUiContent/SuiWorld/Bridge/SuiPortal.h"
 #include "SuiWorldState.h"
@@ -483,23 +486,25 @@ void ForceRelease(WorldSession* session, AckResult reason)
     DoRelease(session, reason, true);
 }
 
-void HandleOrder(WorldSession* session, uint8 orderType,
-    std::vector<ObjectGuid> const& subjects, ObjectGuid targetGuid,
-    float x, float y, float z)
+// One member, one order. Split out of HandleOrder's lambda (2026-08-20) so the
+// stock-client `.sui order` chat command can reach the same actuation WITHOUT going
+// through HandleOrder — that entry point calls SetSuiCapable, which is correct for a
+// CMSG_SUI_ORDER packet (the client just proved it speaks the custom protocol) and
+// wrong for a chat line (a stock client would then be sent SMSG_SUI_* it cannot parse).
+// Authority checks live here, so both callers get them.
+void OrderOne(Player* player, Player* pMember, uint8 orderType,
+    ObjectGuid targetGuid, float x, float y, float z)
 {
-    session->SetSuiCapable(true);
-    Player* player = session->GetPlayer();
-    if (!player || session->GetBot())
+    if (!player || !pMember)
         return;
+
     // Solo is legal: the unattended own character (freecam with no party) must
     // obey RTS orders too — a group only widens the orderable set. This gate
     // silently ate every order a partyless owner clicked from the free view.
     Group* group = player->GetGroup();
 
-    auto orderBot = [&](Player* pMember)
-    {
-        if (!pMember)
-            return;
+    {   // Body kept at its original indentation: this was HandleOrder's orderBot lambda
+        // verbatim, and de-indenting it would bury a pure move in a whitespace diff.
         // In a party: subjects must be members. Solo (group null): ONLY the own
         // character — matching on GetGroup() alone would let a partyless session
         // order any ungrouped AI-attached body on the server.
@@ -596,20 +601,51 @@ void HandleOrder(WorldSession* session, uint8 orderType,
                 pMember->AttackStop();
                 ai->m_currentTask.type = TASK_IDLE;
                 pMember->GetMotionMaster()->MoveIdle();
+                ai->ClearPendingCast();   // an explicit stop cancels a cast still closing in
                 break;
+            case ORDER_CAST:
+            {
+                // Spell id rides in `x` (see OrderType in SuiPossess.h). An empty
+                // targetGuid means "the commander's own target", which is what a hotbar
+                // press without an explicit subject should do; OrderCast falls back to
+                // the member itself when there is no target at all, so self-buffs and
+                // heals work from the same button.
+                Unit* castTarget = nullptr;
+                if (!targetGuid.IsEmpty())
+                    castTarget = pMember->GetMap()->GetUnit(targetGuid);
+                else if (ObjectGuid sel = player->GetSelectionGuid())
+                    castTarget = pMember->GetMap()->GetUnit(sel);
+                OrderCast(player, pMember, uint32(x), castTarget);
+                break;
+            }
             default:
                 break;
         }
-    };
+    }
+}
+
+void HandleOrder(WorldSession* session, uint8 orderType,
+    std::vector<ObjectGuid> const& subjects, ObjectGuid targetGuid,
+    float x, float y, float z)
+{
+    // The session just sent CMSG_SUI_ORDER, so it demonstrably speaks the custom
+    // protocol and may be sent SMSG_SUI_*. Only this packet-driven entry point may
+    // conclude that — see the note on OrderOne.
+    session->SetSuiCapable(true);
+    Player* player = session->GetPlayer();
+    if (!player || session->GetBot())
+        return;
+
+    Group* group = player->GetGroup();
 
     if (!subjects.empty())
         for (ObjectGuid guid : subjects)
-            orderBot(sObjectMgr.GetPlayer(guid));
+            OrderOne(player, sObjectMgr.GetPlayer(guid), orderType, targetGuid, x, y, z);
     else if (group)
         for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
-            orderBot(itr->getSource());
+            OrderOne(player, itr->getSource(), orderType, targetGuid, x, y, z);
     else
-        orderBot(player);   // empty subject list solo = the own character
+        OrderOne(player, player, orderType, targetGuid, x, y, z);   // empty subject list solo = the own character
 }
 
 // ── Hooks ────────────────────────────────────────────────────────────────────
@@ -706,6 +742,126 @@ void BroadcastRoster(Group* group)
         if (member && member->GetSession() && !member->GetSession()->GetBot())
             SendRoster(member);
     }
+}
+
+// ── Ordered casting ──────────────────────────────────────────────────────────
+
+// How long a member keeps trying to close on a target that was merely out of range or
+// behind a corner before the order is declared failed. Long enough to cross a room,
+// short enough that a bad order does not have the member jogging after a fleeing mob.
+#define SUI_CAST_RETRY_BUDGET_MS 5000
+
+char const* CastResultText(SpellCastResult result)
+{
+    switch (result)
+    {
+        case SPELL_FAILED_OUT_OF_RANGE:       return "out of range";
+        case SPELL_FAILED_LINE_OF_SIGHT:      return "no line of sight";
+        case SPELL_FAILED_NO_POWER:           return "not enough power";
+        case SPELL_FAILED_NOT_READY:          return "on cooldown";
+        case SPELL_FAILED_UNIT_NOT_INFRONT:   return "target not in front";
+        case SPELL_FAILED_BAD_TARGETS:        return "invalid target";
+        case SPELL_FAILED_BAD_IMPLICIT_TARGETS: return "invalid target";
+        case SPELL_FAILED_SPELL_IN_PROGRESS:  return "already casting";
+        case SPELL_FAILED_MOVING:             return "moving";
+        case SPELL_FAILED_CASTER_AURASTATE:   return "cannot cast right now";
+        case SPELL_FAILED_TARGET_AURASTATE:   return "target state prevents it";
+        case SPELL_FAILED_IMMUNE:             return "target is immune";
+        case SPELL_FAILED_INTERRUPTED:        return "interrupted";
+        case SPELL_FAILED_TARGET_AFFECTING_COMBAT: return "target is in combat";
+        default:                              return nullptr;   // caller prints the code
+    }
+}
+
+static void ReportCastResult(Player* commander, Player* member, uint32 spellId,
+    SpellCastResult result)
+{
+    if (!commander || !commander->GetSession())
+        return;
+
+    ChatHandler handler(commander);
+    if (char const* text = CastResultText(result))
+        handler.PSendSysMessage("[SUI] %s: %s (spell %u)", member->GetName(), text, spellId);
+    else
+        handler.PSendSysMessage("[SUI] %s: cast failed, code %u (spell %u)",
+            member->GetName(), uint32(result), spellId);
+}
+
+void OrderCast(Player* commander, Player* member, uint32 spellId, Unit* target)
+{
+    if (!commander || !member || !member->IsInWorld())
+        return;
+
+    ChatHandler handler(commander);
+
+    if (!spellId || !sSpellMgr.GetSpellEntry(spellId))
+    {
+        handler.PSendSysMessage("[SUI] spell %u does not exist.", spellId);
+        return;
+    }
+
+    // The hotbar only ever offers spells the member actually knows, so an unknown spell
+    // here means a stale addon catalog (levelled since the last download) or a typo.
+    // Refusing is honest; casting it triggered would be inventing an ability.
+    if (!member->HasSpell(spellId))
+    {
+        handler.PSendSysMessage("[SUI] %s does not know spell %u.", member->GetName(), spellId);
+        return;
+    }
+
+    if (!member->IsAlive())
+    {
+        handler.PSendSysMessage("[SUI] %s is dead.", member->GetName());
+        return;
+    }
+
+    if (!target)
+        target = member;
+
+    if (!target->IsInWorld() || target->GetMapId() != member->GetMapId())
+    {
+        handler.PSendSysMessage("[SUI] %s: target is not here.", member->GetName());
+        return;
+    }
+
+    AiBotAI* ai = dynamic_cast<AiBotAI*>(member->AI());
+
+    // A new order supersedes whatever the member was still trying to land.
+    if (ai)
+        ai->ClearPendingCast();
+
+    // Face the target and stop: a moving caster fails CheckCast on anything with a cast
+    // time, and a mis-faced one fails UNIT_NOT_INFRONT. Doing this before the attempt is
+    // the difference between "your companion tried" and "your companion refused".
+    if (target != member)
+        member->SetFacingToObject(target);
+    if (member->IsMoving())
+        member->StopMoving();
+
+    SpellCastResult result = member->CastSpell(target, spellId, false);
+    if (result == SPELL_CAST_OK)
+        return;
+
+    // Range and LOS are positional, and position is the one thing the member can fix by
+    // itself. Everything else is a real refusal and is reported now.
+    if ((result == SPELL_FAILED_OUT_OF_RANGE || result == SPELL_FAILED_LINE_OF_SIGHT) && ai)
+    {
+        ai->ArmPendingCast(spellId, target->GetObjectGuid(), commander->GetObjectGuid(),
+            SUI_CAST_RETRY_BUDGET_MS);
+
+        char json[192];
+        snprintf(json, sizeof(json),
+            "{\"type\":\"MOVE_TO\",\"payload\":{\"mapId\":%u,\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}}",
+            target->GetMapId(), target->GetPositionX(), target->GetPositionY(),
+            target->GetPositionZ());
+        ai->BridgeProcessLine(json);   // owner order, not brain: un-gated by design
+
+        handler.PSendSysMessage("[SUI] %s: %s — closing in.",
+            member->GetName(), CastResultText(result));
+        return;
+    }
+
+    ReportCastResult(commander, member, spellId, result);
 }
 
 } // namespace SuiPossess
@@ -1022,5 +1178,559 @@ bool ChatHandler::HandleSuiReleaseCommand(char* /*args*/)
     // pending-state machine parking its movement stream first.
     SuiPossess::ForceRelease(m_session, SuiPossess::RELEASED);
     SendSysMessage("[SUI] released");
+    return true;
+}
+
+// ── Companions (.sui companion add|remove|list) ──────────────────────────────
+//
+// A companion is one of the OWNER'S OWN characters run headless beside them: real
+// gear, real talents, real quest log, real progression. It is NOT a fabricated bot
+// and is deliberately never written to the `playerbot` registry — that table is the
+// fabricated-bot roster, and a real character in it would be respawned on a synthetic
+// account after a restart (the Tesfff failure, see the wall in AiBotAI::OnSessionLoaded).
+// Enrolment is therefore runtime-only and re-issued after a server restart.
+//
+// Behaviour comes free: once the companion is in a group with a real player,
+// ResolveDoctrine selects PlayerParty — assist the human's target, defend the party,
+// run the class rotation, and never initiate a pull. Authorship is what the companion
+// flag changes: STATE carries companion:1 and the C# brain never plans for it.
+
+bool ChatHandler::HandleSuiCompanionAddCommand(char* args)
+{
+    Player* owner = m_session ? m_session->GetPlayer() : nullptr;
+    if (!owner)
+        return false;
+
+    char* name = ExtractLiteralArg(&args);
+    if (!name || !*name)
+    {
+        SendSysMessage("[SUI] usage: .sui companion add <charactername>");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string charName = name;
+    ObjectGuid guid = sObjectMgr.GetPlayerGuidByName(charName);
+    if (guid.IsEmpty())
+    {
+        PSendSysMessage("[SUI] no character named '%s'.", charName.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    uint32 const lowGuid = guid.GetCounter();
+
+    if (ObjectAccessor::FindPlayer(guid))
+    {
+        PSendSysMessage("[SUI] %s is already in the world.", charName.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (PlayerBotEntry* existing = sPlayerBotMgr.GetBotEntry(lowGuid))
+    {
+        if (existing->state != PB_STATE_OFFLINE)
+        {
+            PSendSysMessage("[SUI] %s is already loaded as a bot.", charName.c_str());
+            SetSentErrorMessage(true);
+            return false;
+        }
+    }
+
+    PlayerCacheData const* cache = sObjectMgr.GetPlayerDataByGUID(lowGuid);
+    if (!cache)
+    {
+        PSendSysMessage("[SUI] no cached data for '%s'.", charName.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // One account carries one session, so a companion cannot live on the account you
+    // are playing. This is the single most common way the command fails; say so plainly
+    // rather than letting AddBot fail with a log line the player never sees.
+    if (cache->uiAccount == m_session->GetAccountId())
+    {
+        PSendSysMessage("[SUI] %s is on the account you are logged into. "
+            "A companion needs its own account — one account carries one session.",
+            charName.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // Spawn params are inert on this path: the character exists, so OnSessionLoaded
+    // takes the restart branch and LoginPlayer restores its real position and stats.
+    // They are passed truthfully anyway so any future first-spawn branch cannot lie.
+    AiBotAI* ai = new AiBotAI(uint8(cache->uiRace), uint8(cache->uiClass), cache->uiLevel,
+        cache->uiMapId, 0, cache->fPosX, cache->fPosY, cache->fPosZ, cache->fOrientation);
+    ai->SetCompanion(true);
+    ai->SetCompanionOwner(owner->GetObjectGuid());
+
+    if (!sPlayerBotMgr.AddBot(lowGuid, false, ai, true))
+    {
+        delete ai;
+        PSendSysMessage("[SUI] could not load %s — is its account online?", charName.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    PSendSysMessage("[SUI] %s enrolled as a companion; it will join your party on login.",
+        charName.c_str());
+    return true;
+}
+
+bool ChatHandler::HandleSuiCompanionRemoveCommand(char* args)
+{
+    if (!m_session || !m_session->GetPlayer())
+        return false;
+
+    char* name = ExtractLiteralArg(&args);
+    if (!name || !*name)
+    {
+        SendSysMessage("[SUI] usage: .sui companion remove <charactername>");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string charName = name;
+    ObjectGuid guid = sObjectMgr.GetPlayerGuidByName(charName);
+    if (guid.IsEmpty())
+    {
+        PSendSysMessage("[SUI] no character named '%s'.", charName.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    PlayerBotEntry* entry = sPlayerBotMgr.GetBotEntry(guid.GetCounter());
+    if (!entry || !entry->isCompanion)
+    {
+        PSendSysMessage("[SUI] %s is not an active companion.", charName.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // The manager's Update loop owns teardown: it pulls the body from the group and
+    // logs the session out through IsSavingAllowed(entry), which is true for a
+    // companion regardless of PlayerBot.AllowSaving. That is the path that persists
+    // the session's XP, loot and quest progress — do not shortcut it.
+    entry->requestRemoval = true;
+    PSendSysMessage("[SUI] %s is logging out (progress will be saved).", charName.c_str());
+    return true;
+}
+
+bool ChatHandler::HandleSuiCompanionListCommand(char* /*args*/)
+{
+    Player* owner = m_session ? m_session->GetPlayer() : nullptr;
+
+    std::vector<PlayerBotEntry*> companions;
+    sPlayerBotMgr.GetCompanions(companions);
+
+    if (companions.empty())
+    {
+        SendSysMessage("[SUI] no companions online.");
+        return true;
+    }
+
+    for (PlayerBotEntry* entry : companions)
+    {
+        Player* body = entry->ai ? entry->ai->me : nullptr;
+        if (!body)
+        {
+            PSendSysMessage("  guid %u — loading", uint32(entry->playerGUID));
+            continue;
+        }
+
+        char const* focus = "idle";
+        if (Unit* victim = body->GetVictim())
+            focus = victim->GetName();
+
+        if (owner && owner->IsInWorld() && body->IsInWorld() && body->GetMapId() == owner->GetMapId())
+            PSendSysMessage("  %s — level %u, %.0fyd away, %s",
+                body->GetName(), body->GetLevel(), owner->GetDistance(body), focus);
+        else
+            PSendSysMessage("  %s — level %u, %s", body->GetName(), body->GetLevel(), focus);
+    }
+    return true;
+}
+
+// ── Companion talents ────────────────────────────────────────────────────────
+//
+// A companion's session has no socket, so it can never receive CMSG_LEARN_TALENT, and the
+// possessor's copy of that opcode is hardwired to _player (SkillHandler.cpp) — it spends YOUR
+// point, not the companion's. `.spec` is the same shape: every handler resolves
+// m_session->GetPlayer(). So without these commands there is no in-game way to spend a
+// companion's talent points at all; the only routes are raw SQL or logging the character in
+// with a real client.
+//
+// Deliberately NOT solved by rerouting the opcode: your client's talent frame renders YOUR
+// tree — point totals, learned ranks, row gating all belong to your character — so a reroute
+// would spend the companion's points against the wrong UI. A command is the honest surface.
+
+namespace
+{
+    // Resolve an ENROLLED, in-world companion by name. Nothing here may operate on an
+    // arbitrary player: these commands mutate a character permanently.
+    Player* ResolveCompanionBody(ChatHandler* handler, std::string const& name)
+    {
+        ObjectGuid guid = sObjectMgr.GetPlayerGuidByName(name);
+        if (guid.IsEmpty())
+        {
+            handler->PSendSysMessage("[SUI] no character named '%s'.", name.c_str());
+            return nullptr;
+        }
+
+        PlayerBotEntry* entry = sPlayerBotMgr.GetBotEntry(guid.GetCounter());
+        if (!entry || !entry->isCompanion)
+        {
+            handler->PSendSysMessage("[SUI] %s is not an active companion.", name.c_str());
+            return nullptr;
+        }
+
+        Player* body = entry->ai ? entry->ai->me : nullptr;
+        if (!body || !body->IsInWorld())
+        {
+            handler->PSendSysMessage("[SUI] %s is still loading.", name.c_str());
+            return nullptr;
+        }
+        return body;
+    }
+
+    // How many ranks of this talent the body already has. Same walk Player::LearnTalent uses
+    // to compute curtalent_maxrank, so "the next rank" here means what LearnTalent means.
+    uint32 LearnedRankCount(Player* body, TalentEntry const* talentInfo)
+    {
+        for (int32 k = MAX_TALENT_RANK - 1; k > -1; --k)
+            if (talentInfo->RankID[k] && body->HasSpell(talentInfo->RankID[k]))
+                return uint32(k + 1);
+        return 0;
+    }
+
+    // The rotation reads a cached spell list, so a freshly learned talent is invisible to it
+    // until that cache is rebuilt. Same pair the AI runs at login and on level-up.
+    void RefreshCompanionSpells(Player* body)
+    {
+        if (AiBotAI* ai = dynamic_cast<AiBotAI*>(body->AI()))
+        {
+            ai->ResetSpellData();
+            ai->PopulateSpellData();
+        }
+    }
+}
+
+// .sui companion talent <name> [talentlink|talentId] [rank]
+//
+// With no talent argument: report unspent points. Otherwise spend one.
+//
+// The rank argument is 0-based and rarely wanted. Omitted, the command spends the NEXT rank,
+// derived from the body's own spellbook — which is why a talent link shift-clicked out of
+// YOUR tree works as the argument even though its embedded rank describes your character.
+bool ChatHandler::HandleSuiCompanionTalentCommand(char* args)
+{
+    if (!m_session || !m_session->GetPlayer())
+        return false;
+
+    char* name = ExtractLiteralArg(&args);
+    if (!name || !*name)
+    {
+        SendSysMessage("[SUI] usage: .sui companion talent <name> [talentlink|talentId] [rank]");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string charName = name;
+    Player* body = ResolveCompanionBody(this, charName);
+    if (!body)
+    {
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    uint32 const freePoints = body->GetFreeTalentPoints();
+
+    uint32 talentId = 0;
+    if (!ExtractTalentFromLink(&args, talentId))
+    {
+        // No talent given — treat as a query rather than an error. Checking before spending
+        // is the common case, and there is no other way to see a companion's point total
+        // (the M4 snapshot that carries it is MSUIClient-only).
+        PSendSysMessage("[SUI] %s (level %u) has %u unspent talent point(s).",
+            body->GetName(), body->GetLevel(), freePoints);
+        PSendSysMessage("[SUI] shift-click a talent into: .sui companion talent %s <talent>",
+            body->GetName());
+        return true;
+    }
+
+    TalentEntry const* talentInfo = sTalentStore.LookupEntry(talentId);
+    if (!talentInfo)
+    {
+        PSendSysMessage("[SUI] talent %u does not exist.", talentId);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // Pre-checks exist purely to produce a REASON. Player::LearnTalent returns a bare bool,
+    // so without these every refusal would read the same and be undiagnosable. It re-checks
+    // all of this itself — these never substitute for its authority, only explain it.
+    TalentTabEntry const* tabInfo = sTalentTabStore.LookupEntry(talentInfo->TalentTab);
+    if (!tabInfo)
+    {
+        PSendSysMessage("[SUI] talent %u has no talent tab.", talentId);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if ((body->GetClassMask() & tabInfo->ClassMask) == 0)
+    {
+        PSendSysMessage("[SUI] that talent is not for %s's class.", body->GetName());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    uint32 const learned = LearnedRankCount(body, talentInfo);
+
+    // 0-based: the count of learned ranks IS the index of the next one. Initialised up front
+    // so a partial parse inside ExtractUInt32 can never leave it indeterminate.
+    uint32 rank = learned;
+    if (!ExtractUInt32(&args, rank))
+        rank = learned;
+
+    if (rank >= MAX_TALENT_RANK)
+    {
+        PSendSysMessage("[SUI] rank must be 0-%u (0-based).", MAX_TALENT_RANK - 1);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (!talentInfo->RankID[rank])
+    {
+        PSendSysMessage("[SUI] %s is already at max rank (%u).", body->GetName(), learned);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (learned >= rank + 1)
+    {
+        PSendSysMessage("[SUI] %s already has rank %u of that talent.", body->GetName(), learned);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (freePoints < (rank - learned + 1))
+    {
+        PSendSysMessage("[SUI] %s has %u unspent point(s); that needs %u.",
+            body->GetName(), freePoints, rank - learned + 1);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (!body->LearnTalent(talentId, rank))
+    {
+        // Everything cheap has been checked, so what is left is the tree's own structure:
+        // an unmet prerequisite talent, a required spell, or not enough points spent in the
+        // tab to open that row. Name those three rather than printing a bare failure.
+        PSendSysMessage("[SUI] %s could not learn that talent — check its prerequisite, "
+            "its required spell, and whether enough points are spent in that tree to open the row.",
+            body->GetName());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    RefreshCompanionSpells(body);
+
+    PSendSysMessage("[SUI] %s learned rank %u; %u point(s) left.",
+        body->GetName(), rank + 1, body->GetFreeTalentPoints());
+    return true;
+}
+
+// .sui companion untalent <name> — full respec, no cost.
+//
+// Free on purpose: a companion cannot walk itself to a trainer, and without this a misclick
+// would be unfixable without logging the character in on a real client. The trainer's gold
+// cost exists to make respeccing a decision; that pressure belongs to characters you play
+// directly, not to a mis-typed command.
+bool ChatHandler::HandleSuiCompanionUntalentCommand(char* args)
+{
+    if (!m_session || !m_session->GetPlayer())
+        return false;
+
+    char* name = ExtractLiteralArg(&args);
+    if (!name || !*name)
+    {
+        SendSysMessage("[SUI] usage: .sui companion untalent <name>");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string charName = name;
+    Player* body = ResolveCompanionBody(this, charName);
+    if (!body)
+    {
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (!body->ResetTalents(true))
+    {
+        PSendSysMessage("[SUI] %s has no talents to reset.", body->GetName());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    RefreshCompanionSpells(body);
+
+    PSendSysMessage("[SUI] %s respecced — %u point(s) available.",
+        body->GetName(), body->GetFreeTalentPoints());
+    return true;
+}
+
+// .sui cast <member> <spellId> [target|me|self|<playername>]
+//
+// The stock-client surface for ordered casting, and the one the MSUI_Companion hotbar
+// drives — a 1.12 addon can only reach the server through SendChatMessage, so a chat
+// command is the channel. Same implementation as the custom-client ORDER_CAST opcode.
+//
+//   target   (default) the unit YOU have selected — "cast this at what I'm looking at"
+//   me                 you, the commander — heals and buffs aimed at yourself
+//   self               the member itself — its own buffs, bandages, defensive cooldowns
+//   <name>             any player, for spot-healing a specific party member
+bool ChatHandler::HandleSuiCastCommand(char* args)
+{
+    Player* commander = m_session ? m_session->GetPlayer() : nullptr;
+    if (!commander)
+        return false;
+
+    char* memberName = ExtractLiteralArg(&args);
+    uint32 spellId = 0;
+    if (!memberName || !*memberName || !ExtractUInt32(&args, spellId) || !spellId)
+    {
+        SendSysMessage("[SUI] usage: .sui cast <member> <spellId> [target|me|self|<playername>]");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string name = memberName;
+    Player* member = sObjectMgr.GetPlayer(name.c_str());
+    if (!member || !member->IsInWorld())
+    {
+        PSendSysMessage("[SUI] %s is not in the world.", name.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // Only your own party, and only bodies that actually have an AI to command. This is
+    // the same authority test HandleOrder applies: a manually driven character has no
+    // AiBotAI and must never be puppeted by someone else's chat line.
+    Group* group = commander->GetGroup();
+    if (member != commander && (!group || member->GetGroup() != group))
+    {
+        PSendSysMessage("[SUI] %s is not in your party.", member->GetName());
+        SetSentErrorMessage(true);
+        return false;
+    }
+    if (!dynamic_cast<AiBotAI*>(member->AI()))
+    {
+        PSendSysMessage("[SUI] %s is not under AI control.", member->GetName());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    Unit* target = nullptr;
+    char* targetArg = ExtractLiteralArg(&args);
+    std::string targetSpec = targetArg ? targetArg : "target";
+
+    if (targetSpec == "self")
+        target = member;
+    else if (targetSpec == "me")
+        target = commander;
+    else if (targetSpec == "target")
+    {
+        if (ObjectGuid sel = commander->GetSelectionGuid())
+            target = commander->GetMap()->GetUnit(sel);
+        // No selection: OrderCast defaults to the member, so a self-buff bound to a
+        // plain button still works when you happen to have nothing targeted.
+    }
+    else if (Player* named = sObjectMgr.GetPlayer(targetSpec.c_str()))
+        target = named;
+    else
+    {
+        PSendSysMessage("[SUI] no player named '%s'.", targetSpec.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    SuiPossess::OrderCast(commander, member, spellId, target);
+    return true;
+}
+
+// .sui order <member> <stop|come|hold|follow>
+//
+// The standing-order half of the hotbar. These are the existing RTS orders, reached
+// from a stock client: HandleOrder does the authority checks and the actuation, this
+// only translates a word into an order type and its one meaningful parameter.
+//
+//   stop     break off, clear the waypoint chain, cancel a cast still closing in
+//   come     walk to where you are standing right now
+//   hold     unlink from the chain — stand this ground, keep assisting from it
+//   follow   relink — resume formation on you
+bool ChatHandler::HandleSuiOrderCommand(char* args)
+{
+    Player* commander = m_session ? m_session->GetPlayer() : nullptr;
+    if (!commander)
+        return false;
+
+    char* memberName = ExtractLiteralArg(&args);
+    char* orderWord = ExtractLiteralArg(&args);
+    if (!memberName || !*memberName || !orderWord || !*orderWord)
+    {
+        SendSysMessage("[SUI] usage: .sui order <member> <stop|come|hold|follow>");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string name = memberName;
+    Player* member = sObjectMgr.GetPlayer(name.c_str());
+    if (!member || !member->IsInWorld())
+    {
+        PSendSysMessage("[SUI] %s is not in the world.", name.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string word = orderWord;
+    uint8 orderType;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+
+    if (word == "stop")
+        orderType = SuiPossess::ORDER_STOP;
+    else if (word == "come")
+    {
+        orderType = SuiPossess::ORDER_MOVE;
+        x = commander->GetPositionX();
+        y = commander->GetPositionY();
+        z = commander->GetPositionZ();
+    }
+    else if (word == "hold")
+    {
+        orderType = SuiPossess::ORDER_LINK;
+        x = 0.0f;   // < 0.5 unlinks: stands its ground
+    }
+    else if (word == "follow")
+    {
+        orderType = SuiPossess::ORDER_LINK;
+        x = 1.0f;   // >= 0.5 links back into the chain
+    }
+    else
+    {
+        PSendSysMessage("[SUI] unknown order '%s' — try stop, come, hold or follow.", word.c_str());
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // Straight to OrderOne, NOT through HandleOrder: that entry point marks the session
+    // SUI-capable, which is right for a custom-client packet and wrong here — a stock
+    // client issuing a chat command would then be sent SMSG_SUI_* it cannot parse.
+    // OrderOne still enforces the party and AI-attached checks.
+    SuiPossess::OrderOne(commander, member, orderType, ObjectGuid(), x, y, z);
+
+    PSendSysMessage("[SUI] %s: %s.", member->GetName(), word.c_str());
     return true;
 }

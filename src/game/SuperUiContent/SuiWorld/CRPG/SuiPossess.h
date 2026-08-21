@@ -25,6 +25,7 @@
 
 #include "Common.h"
 #include "ObjectGuid.h"
+#include "SpellDefines.h"   // SpellCastResult, in the OrderCast/CastResultText signatures
 
 #include <vector>
 
@@ -74,7 +75,12 @@ namespace SuiPossess
         ORDER_PATROL = 4,       // loop the queued waypoints until MOVE/STOP clears them
         ORDER_FOLLOW = 5,       // targetGuid = group member to escort; empty = auto split
         ORDER_LINK = 6,         // x >= 0.5 links the member into the chain; else unlinks
+        ORDER_CAST = 7,         // x = spell id (see below); targetGuid = the unit to cast on
     };
+    // ORDER_CAST carries its spell id in `x` rather than growing the Order packet, which
+    // would break the existing client contract. ORDER_LINK already overloads `x` as a
+    // boolean, so the precedent is the packet's own. A float holds every 1.12 spell id
+    // exactly (ids are far below 2^24), so the round-trip is lossless.
 
     // SMSG_SUI_CONTROL_ROSTER member flags
     enum RosterFlags : uint8
@@ -106,6 +112,32 @@ namespace SuiPossess
     void HandleOrder(WorldSession* session, uint8 orderType,
         std::vector<ObjectGuid> const& subjects, ObjectGuid targetGuid,
         float x, float y, float z);
+
+    /// Apply ONE order to ONE member, authority checks included. HandleOrder is the
+    /// packet entry point and fans out to this; the stock-client `.sui order` command
+    /// calls it directly, deliberately bypassing HandleOrder's SetSuiCapable — a chat
+    /// line is no evidence the client can parse SMSG_SUI_*, and marking it capable
+    /// would start pushing custom opcodes at a client that cannot read them.
+    void OrderOne(Player* commander, Player* member, uint8 orderType,
+        ObjectGuid targetGuid, float x, float y, float z);
+
+    /// Order one party member to cast one spell. The shared implementation behind both
+    /// ORDER_CAST and the stock-client `.sui cast` command.
+    ///
+    /// The cast runs through Player::CastSpell UNTRIGGERED on purpose: Spell::CheckCast
+    /// then enforces range, line of sight, power cost, cooldown, GCD, aura state and
+    /// facing exactly as it would for a human. "Respect limitations" is not reimplemented
+    /// here — it is inherited by refusing to bypass the real spell path.
+    ///
+    /// A member whose session has no socket cannot be told why its own cast failed, so
+    /// the result is reported to `commander` instead. Range and LOS failures are not
+    /// terminal: they arm a pending cast that walks the member in and retries.
+    void OrderCast(Player* commander, Player* member, uint32 spellId, Unit* target);
+
+    /// Plain-English name for a cast failure, or nullptr when the code has no friendly
+    /// text and the caller should print the number. Shared with the retry path in
+    /// AiBotAI::UpdatePendingCast so one order never reports two vocabularies.
+    char const* CastResultText(SpellCastResult result);
 
     /// Forced release with a reason code; no-op when the session possesses nothing.
     /// Server-initiated paths open the movement drain window (m_moveRejectTime) so

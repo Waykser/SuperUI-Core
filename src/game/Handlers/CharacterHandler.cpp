@@ -481,7 +481,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder *holder)
         pCurrChar = new Player(this);
         pCurrChar->GetMotionMaster()->Initialize();
 
-        if (GetBot() && !sPlayerBotMgr.IsSavingAllowed())
+        // [SUI] Per-entry: a companion is the owner's real character and always saves.
+        if (GetBot() && !sPlayerBotMgr.IsSavingAllowed(GetBot()))
             pCurrChar->m_saveDisabled = true;
     }
 

@@ -28,9 +28,27 @@
 #include "WorldSession.h"
 #include "UpdateMask.h"
 #include "Anticheat.h"
+#include "Chat.h"   // [SUI] the refusal message while possessing (GetSuiControlledGuid is on WorldSession)
 
 void WorldSession::HandleLearnTalentOpcode(WorldPackets::Skill::LearnTalent const& packet)
 {
+    // [SUI] While possessing, your talent frame is still rendering YOUR tree — your point
+    // total, your learned ranks, your row gating — but the body you are looking at is the
+    // companion's. Left alone, this line silently spends YOUR point while you believe you
+    // are talenting the companion, which is a permanent, unnoticed mistake.
+    //
+    // Deliberately a REFUSAL, not a reroute to GetSuiActor(): sending the point to the
+    // companion would spend it against the wrong UI, so you would be respeccing blind —
+    // worse than being stopped. `.sui companion talent` is the surface that knows whose
+    // tree it is operating on.
+    if (_player && !GetSuiControlledGuid().IsEmpty())
+    {
+        ChatHandler(_player).PSendSysMessage(
+            "[SUI] Not while possessing — this would spend YOUR talent point. "
+            "Use: .sui companion talent <name> <talent>");
+        return;
+    }
+
     _player->LearnTalent(packet.talent_id, packet.requested_rank);
 }
 

@@ -426,7 +426,7 @@ void AiBotAI::BridgeSendState()
         "\"taskKind\":\"%s\",\"taskActivity\":\"%s\","
         "\"taskCreature\":%u,\"taskDestX\":%.2f,\"taskDestY\":%.2f,\"taskDestZ\":%.2f,\"taskKills\":%d,"
         "\"quests\":\"%s\","
-        "\"questId\":%u,\"questStatus\":%u,\"possessed\":%u}}",
+        "\"questId\":%u,\"questStatus\":%u,\"possessed\":%u,\"companion\":%u}}",
         me->GetGUIDLow(),
         me->GetHealth(), me->GetMaxHealth(),
         me->GetPower(POWER_MANA), me->GetMaxPower(POWER_MANA),
@@ -441,7 +441,7 @@ void AiBotAI::BridgeSendState()
         taskKindStr, activityStr,
         m_currentTask.creatureEntry, m_currentTask.x, m_currentTask.y, m_currentTask.z, m_currentTask.killCount,
         questBlob.c_str(),
-        m_trackedQuestId, questStatus, m_possessed ? 1u : 0u);
+        m_trackedQuestId, questStatus, m_possessed ? 1u : 0u, m_companion ? 1u : 0u);
 
     BridgeSend(json);
 }
@@ -488,7 +488,7 @@ void AiBotAI::BridgeRecv()
         {
             *newline = '\0';
             if (newline > start) // skip empty lines
-                BridgeProcessLine(start);
+                BridgeProcessLine(start, true);   // off the socket = the C# brain
             start = newline + 1;
         }
 
@@ -562,7 +562,7 @@ static bool JsonExtractString(const char* json, const char* key, char* out, int 
     return true;
 }
 
-void AiBotAI::BridgeProcessLine(const char* line)
+void AiBotAI::BridgeProcessLine(const char* line, bool fromBrain)
 {
     // Extract "type" field
     char msgType[32] = {0};
@@ -585,6 +585,19 @@ void AiBotAI::BridgeProcessLine(const char* line)
         sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "[AIBOT-BRIDGE] %s: dropped %s (possessed)",
             me->GetName(), msgType);
         BridgeSendEvent("POSSESSED_DROP", msgType);
+        return;
+    }
+
+    // [SUI] A companion answers to its owner, not to the brain. STATE carries
+    // companion:1 so the C# side should never have sent this at all; the wall is here
+    // too because "should never" is not an invariant, and one stray SET_TASK_GRIND
+    // would march the owner's character off to farm boars mid-dungeon. Owner orders
+    // reach the same handlers with fromBrain=false and are unaffected.
+    if (m_companion && fromBrain && strcmp(msgType, "PING") != 0)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "[AIBOT-BRIDGE] %s: dropped %s (companion)",
+            me->GetName(), msgType);
+        BridgeSendEvent("COMPANION_DROP", msgType);
         return;
     }
 
