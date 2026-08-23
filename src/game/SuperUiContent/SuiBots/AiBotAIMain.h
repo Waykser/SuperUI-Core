@@ -73,6 +73,13 @@
 #define AIBOT_UPDATE_INTERVAL 1000
 #define AIBOT_ROTATION_SUBTICK_MS 250   // [ROTATION] slate evaluation cadence in combat — the 1s behaviour tick starves GCD weaving; 4 Hz tracks it
 
+// [BOTBAR] How long a human's one-shot cast order keeps retrying before it is
+// abandoned. Long enough to ride out a GCD, a 3s cast already in flight, and a
+// couple of steps back into range; short enough that a spell nobody remembers
+// ordering never fires. AIBOT_CAST_ORDER_MAX_TTL_MS caps what the wire may ask for.
+#define AIBOT_CAST_ORDER_TTL_MS      5000
+#define AIBOT_CAST_ORDER_MAX_TTL_MS  15000
+
 // Bridge config
 #define BRIDGE_HOST "127.0.0.1"
 #define BRIDGE_PORT 3444
@@ -679,6 +686,7 @@ public:
     void BridgeHandleQueryQuestStatus(const char* json);
     void BridgeHandleUseGameObject(const char* json);
     void BridgeHandleQuestCast(const char* json);   // [CLASS-QUEST] cast a quest spell on a target creature
+    void BridgeHandleCastSpell(const char* json);   // [BOTBAR] generic one-shot cast: unit target OR ground destination
     void BridgeHandleFormGroup(const char* json);
     void BridgeHandleDisbandGroup(const char* json);
     void BridgeHandleSetEscort(const char* json);   // [FOLLOW-CMD] "{bot} follow {player}" — sets/clears m_escortOverrideName
@@ -896,6 +904,38 @@ public:
     };
     std::vector<RotationInstruction> m_rotation;
     std::string m_rotationProfile;            // observability: echoed in logs/acks
+
+    // --- [BOTBAR] One-shot cast ordered by a grouped human (.botspell cast) ---
+    // A player's order outranks the slate for a short window. It has to survive a
+    // failed attempt: the click lands on whatever tick the player happened to press,
+    // which is very often mid-GCD, mid-cast, or a step out of range. Dropping it
+    // there is what would make the button feel broken, so the order parks here and
+    // is retried at 4 Hz until it fires or the TTL runs out — that retry IS "to the
+    // best of their ability".
+    //
+    // Positional orders carry a resolved destination instead of a unit: the command
+    // layer turns the player's anchor keyword into coordinates, so nothing downstream
+    // ever has to know what an anchor is.
+    struct PlayerCastOrder
+    {
+        uint32 spellId = 0;
+        SpellEntry const* pSpell = nullptr;
+        ObjectGuid targetGuid;                // empty when positional
+        float  x = 0.f, y = 0.f, z = 0.f;
+        bool   positional = false;
+        uint32 expiresAtMs = 0;               // WorldTimer ms; 0 = no order parked
+        ObjectGuid commanderGuid;             // who to report the outcome to
+        uint32 lastFailMs = 0;                // throttles the "still trying" chatter
+    };
+    PlayerCastOrder m_playerOrder;
+
+    // Attempt the parked order. Returns true when it fired (or was cleared this
+    // tick); false when there is nothing parked or it is still waiting. Called from
+    // the 4 Hz sub-tick and from the head of UpdateRotationSlate.
+    bool TryPlayerCastOrder();
+    void ClearPlayerCastOrder(char const* reason);
+    // Report an outcome to the commanding player if he is still online and grouped.
+    void ReportCastOrder(char const* verb, char const* detail);
 
     // [RAID-PLAN] this bot's adopted slice of the raid plan (PLAN_19 M-C).
     // Stored by BridgeHandleLoadRaidPlan; the EncounterPlay doctrine and the

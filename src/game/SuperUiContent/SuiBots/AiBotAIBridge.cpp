@@ -622,6 +622,8 @@ void AiBotAI::BridgeProcessLine(const char* line)
         BridgeHandleUseGameObject(line);
     else if (strcmp(msgType, "QUEST_CAST") == 0)
         BridgeHandleQuestCast(line);
+    else if (strcmp(msgType, "CAST_SPELL") == 0)
+        BridgeHandleCastSpell(line);
     else if (strcmp(msgType, "FORM_GROUP") == 0)
        BridgeHandleFormGroup(line);
     else if (strcmp(msgType, "DISBAND_GROUP") == 0)
@@ -2685,6 +2687,108 @@ void AiBotAI::BridgeHandleQuestCast(const char* json)
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
         "[AIBOT-QCAST] %s: cast spell %u on %s (entry=%u, dist=%.1f) — objective should credit on cast complete",
         me->GetName(), spellId, pTarget->GetName(), pTarget->GetEntry(), dist);
+}
+
+// ============================================================
+// BridgeHandleCastSpell — [BOTBAR] generic one-shot cast ordered by a human
+//
+// DISPATCH: BridgeProcessLine -> else if (strcmp(msgType,"CAST_SPELL")==0) BridgeHandleCastSpell(line);
+// HEADER:   void BridgeHandleCastSpell(const char* json);
+//
+// This is the generalisation of QUEST_CAST. The differences are deliberate:
+//
+//   - PLAYERS may be targets, not just creatures. QUEST_CAST resolves through
+//     Map::GetCreature only, which makes every heal, buff, and dispel unorderable.
+//   - A DESTINATION may be given instead of a unit, for Blizzard / Rain of Fire /
+//     Volley / Hurricane. The command layer resolves the player's anchor keyword
+//     into coordinates; by the time it reaches here it is just an (x,y,z).
+//   - HasSpell is MANDATORY. QUEST_CAST deliberately falls back to triggered=true
+//     for item-granted quest spells, which is right for a planner and very wrong
+//     here — a player-facing verb that casts spells the bot never learned, with
+//     no cost and no cast time, is a way to make any bot cast anything.
+//
+// The handler only PARKS the order and pokes it once. Everything else — legality,
+// range, LOS, retry, expiry, reporting — lives in TryPlayerCastOrder so the first
+// attempt and the 4 Hz retries cannot drift apart.
+// ============================================================
+void AiBotAI::BridgeHandleCastSpell(const char* json)
+{
+    const char* payload = strstr(json, "\"payload\"");
+    if (!payload) payload = json;
+
+    int spellIdInt = 0, guidInt = 0, entryInt = 0, commanderInt = 0, ttlMs = 0;
+    float x = 0.f, y = 0.f, z = 0.f;
+    JsonExtractInt(payload, "spell_id", spellIdInt);
+    JsonExtractInt(payload, "target_guid", guidInt);
+    JsonExtractInt(payload, "target_entry", entryInt);
+    JsonExtractInt(payload, "commander_guid", commanderInt);
+    JsonExtractInt(payload, "ttl_ms", ttlMs);
+    // Presence of "x" is what makes this a ground order — a destination of exactly
+    // (0,0,0) is not a real position on any map, so absence and origin are the same
+    // answer and we don't need a separate flag on the wire.
+    bool const positional = JsonExtractFloat(payload, "x", x)
+                         && JsonExtractFloat(payload, "y", y)
+                         && JsonExtractFloat(payload, "z", z);
+
+    uint32 const spellId = (uint32)spellIdInt;
+    if (!spellId)
+    {
+        BridgeSendEvent("CAST_SPELL_FAIL", "reason=bad_payload");
+        return;
+    }
+
+    SpellEntry const* pSpell = sSpellMgr.GetSpellEntry(spellId);
+    if (!pSpell)
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "reason=unknown_spell|spell=%u", spellId);
+        BridgeSendEvent("CAST_SPELL_FAIL", buf);
+        return;
+    }
+
+    if (!me->HasSpell(spellId))
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "reason=not_learned|spell=%u", spellId);
+        BridgeSendEvent("CAST_SPELL_FAIL", buf);
+        if (commanderInt > 0)
+            if (Player* pCommander = sObjectMgr.GetPlayer(ObjectGuid(HIGHGUID_PLAYER, uint32(commanderInt))))
+                ChatHandler(pCommander).PSendSysMessage(
+                    "MSUIBS|ERR|%s|not_learned|%u", me->GetName(), spellId);
+        return;
+    }
+
+    if (!positional && guidInt <= 0)
+    {
+        BridgeSendEvent("CAST_SPELL_FAIL", "reason=no_target");
+        return;
+    }
+
+    // Park it. A new order always replaces the old one — the player's most recent
+    // click is the one they meant, and queueing stale orders behind it is how a
+    // panicked triple-click turns into three casts nobody wanted.
+    m_playerOrder = PlayerCastOrder();
+    m_playerOrder.spellId    = spellId;
+    m_playerOrder.pSpell     = pSpell;
+    m_playerOrder.positional = positional;
+    m_playerOrder.x = x; m_playerOrder.y = y; m_playerOrder.z = z;
+    if (!positional)
+    {
+        m_playerOrder.targetGuid = entryInt > 0
+            ? ObjectGuid(HIGHGUID_UNIT, uint32(entryInt), uint32(guidInt))
+            : ObjectGuid(HIGHGUID_PLAYER, uint32(guidInt));
+    }
+    if (commanderInt > 0)
+        m_playerOrder.commanderGuid = ObjectGuid(HIGHGUID_PLAYER, uint32(commanderInt));
+
+    if (ttlMs <= 0 || ttlMs > AIBOT_CAST_ORDER_MAX_TTL_MS)
+        ttlMs = AIBOT_CAST_ORDER_TTL_MS;
+    m_playerOrder.expiresAtMs = WorldTimer::getMSTime() + (uint32)ttlMs;
+
+    // Poke it once so an instant, in-range cast lands on the same tick as the click
+    // instead of waiting up to 250ms for the sub-tick. Failure here is not final —
+    // the order stays parked and the sub-tick keeps trying until the TTL expires.
+    TryPlayerCastOrder();
 }
 
 // ============================================================

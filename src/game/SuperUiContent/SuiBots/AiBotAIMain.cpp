@@ -1129,11 +1129,20 @@ void AiBotAI::UpdateAI(uint32 const diff)
     if (m_rotationSubTick.Passed())
     {
         m_rotationSubTick.Reset(AIBOT_ROTATION_SUBTICK_MS);
-        if (!m_possessed
-            && !m_rotation.empty() && me && me->IsInWorld() && !me->IsBeingTeleported()
-            && me->IsAlive() && me->IsInCombat()
+
+        bool const castableNow = !m_possessed
+            && me && me->IsInWorld() && !me->IsBeingTeleported() && me->IsAlive()
             && !me->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL)
-            && !me->IsNonMeleeSpellCasted(false, false, true))
+            && !me->IsNonMeleeSpellCasted(false, false, true);
+
+        // [BOTBAR] A human's parked cast order is retried on the SAME 4 Hz cadence but
+        // WITHOUT the slate's two extra preconditions. It must run for a bot that has no
+        // slate loaded (most of the fleet), and out of combat (buffs, heals, a pre-pull
+        // Polymorph) — the two cases the rotation guard below deliberately excludes.
+        if (castableNow && m_playerOrder.expiresAtMs)
+            TryPlayerCastOrder();
+
+        if (castableNow && !m_rotation.empty() && me->IsInCombat())
             UpdateRotationSlate();
     }
 

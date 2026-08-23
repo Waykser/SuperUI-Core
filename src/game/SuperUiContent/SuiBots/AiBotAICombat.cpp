@@ -900,6 +900,14 @@ void AiBotAI::UpdateOutOfCombatAI()
 
 void AiBotAI::UpdateInCombatAI()
 {
+    // [BOTBAR] A human's parked order outranks everything below it, slate and class
+    // rotation alike. This is the 1 Hz half of that precedence (the 250ms sub-tick in
+    // UpdateAI is the other); without it a slate-less bot's class switch would spend
+    // the GCD on its own priority list before the order ever got a look, and the
+    // ordered spell would land a second late or not at all.
+    if (TryPlayerCastOrder())
+        return;
+
     // [ROTATION] A loaded slate OWNS in-combat casting — the class switch below is the
     // vanilla else-branch (RotationSlate design, 2026-05-11). The 250ms sub-tick in
     // UpdateAI is the main driver; this 1s call is just one more evaluation, so a bot
@@ -966,6 +974,162 @@ void AiBotAI::UpdateInCombatAI()
 //  - returns true whenever a slate is present: slate present == combat handled,
 //    even on a tick where nothing was castable (the vanilla switch must not run).
 // ============================================================================
+// ============================================================================
+// [BOTBAR] TryPlayerCastOrder — execute (or keep trying) a human's one-shot order
+//
+// Runs ahead of the slate at 4 Hz and out of combat from the same sub-tick, so a
+// player's click always outranks the bot's own priority list for the length of the
+// order's TTL. That precedence is the entire point: if the slate could win, a
+// commanded Polymorph would lose a coin-flip against a Frostbolt every time.
+//
+// Returns true when the order resolved this tick (fired, expired, or became
+// impossible) and false when nothing is parked or it is still waiting on a GCD /
+// cast / range. A false return leaves the order parked for the next tick — that
+// retry is what "the bot attempts to follow the command to the best of its ability"
+// actually means in code.
+// ============================================================================
+bool AiBotAI::TryPlayerCastOrder()
+{
+    if (!m_playerOrder.expiresAtMs || !m_playerOrder.pSpell)
+        return false;
+
+    uint32 const now = WorldTimer::getMSTime();
+    if (now >= m_playerOrder.expiresAtMs)
+    {
+        ClearPlayerCastOrder("expired");
+        return true;
+    }
+
+    if (!me || !me->IsInWorld() || !me->IsAlive() || me->IsBeingTeleported())
+        return false;
+
+    // Don't stomp a cast already in flight — including, importantly, a previous
+    // order's own cast. Without this the 4 Hz retry would interrupt the very spell
+    // it just started and the bot would stutter forever on a 3s Polymorph.
+    if (me->IsNonMeleeSpellCasted(false, false, true))
+        return false;
+
+    if (me->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL))
+        return false;
+
+    SpellEntry const* pSpell = m_playerOrder.pSpell;
+
+    // ---- Ground order: no unit, just a destination the command layer resolved. ----
+    if (m_playerOrder.positional)
+    {
+        // CanTryToCastSpell's range gate is GetCombatDistance(pTarget) and has no
+        // coordinate form, so the cheap legality checks are borrowed by casting at
+        // ourselves and the range/LOS pair is done by hand against the destination.
+        if (!CanTryToCastSpell(me, pSpell))
+            return false;
+
+        SpellRangeEntry const* srange = sSpellRangeStore.LookupEntry(pSpell->rangeIndex);
+        float const dist = me->GetDistance(m_playerOrder.x, m_playerOrder.y, m_playerOrder.z);
+        if (srange && dist > srange->maxRange)
+            return false;   // walk-in is the player's job; keep trying meanwhile
+
+        // Spell.cpp refuses a player-cast dest-location spell without LOS, so check
+        // it here rather than burning the GCD on a guaranteed SPELL_FAILED.
+        if (!me->IsWithinLOS(m_playerOrder.x, m_playerOrder.y, m_playerOrder.z))
+            return false;
+
+        me->StopMoving();
+        me->SetFacingTo(me->GetAngle(m_playerOrder.x, m_playerOrder.y));
+
+        SpellCastResult const res = me->CastSpell(
+            m_playerOrder.x, m_playerOrder.y, m_playerOrder.z, pSpell, false);
+
+        if (res == SPELL_CAST_OK)
+        {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "spell=%u|ground=1|dist=%d",
+                m_playerOrder.spellId, (int)dist);
+            BridgeSendEvent("CAST_SPELL_ACK", buf);
+            ReportCastOrder("OK", "ground");
+            ClearPlayerCastOrder(nullptr);
+            return true;
+        }
+        return false;   // transient — retry next sub-tick
+    }
+
+    // ---- Unit order. ----
+    Unit* pTarget = nullptr;
+    if (m_playerOrder.targetGuid.IsPlayer())
+        pTarget = sObjectMgr.GetPlayer(m_playerOrder.targetGuid);
+    else
+        pTarget = me->GetMap()->GetCreature(m_playerOrder.targetGuid);
+
+    if (!pTarget || !pTarget->IsInWorld() || !pTarget->IsAlive())
+    {
+        // The target died or despawned. Nothing to retry toward.
+        ClearPlayerCastOrder("target_gone");
+        return true;
+    }
+
+    if (pTarget->GetMapId() != me->GetMapId())
+    {
+        ClearPlayerCastOrder("target_gone");
+        return true;
+    }
+
+    if (!CanTryToCastSpell(pTarget, pSpell))
+        return false;
+
+    if (!me->IsWithinLOSInMap(pTarget))
+        return false;
+
+    // DoCastSpell owns facing, dismount, and the stop-to-cast rule. A ground spell
+    // handed a Unit is converted to a destination at that unit's feet inside
+    // SpellCaster::CastSpell, which is exactly what the "my target" anchor wants —
+    // so Blizzard-on-target needs no special case here at all.
+    SpellCastResult const res = DoCastSpell(pTarget, pSpell);
+    if (res == SPELL_CAST_OK)
+    {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "spell=%u|target=%u|ground=%u",
+            m_playerOrder.spellId, pTarget->GetGUIDLow(),
+            (pSpell->Targets & TARGET_FLAG_DEST_LOCATION) ? 1u : 0u);
+        BridgeSendEvent("CAST_SPELL_ACK", buf);
+        ReportCastOrder("OK", pTarget->GetName());
+        ClearPlayerCastOrder(nullptr);
+        return true;
+    }
+
+    return false;
+}
+
+// Drop the parked order. reason == nullptr means it succeeded and the caller has
+// already reported; any other value is a failure the commander should hear about
+// once, since a button that silently does nothing is indistinguishable from a bug.
+void AiBotAI::ClearPlayerCastOrder(char const* reason)
+{
+    if (reason && m_playerOrder.expiresAtMs)
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "reason=%s|spell=%u", reason, m_playerOrder.spellId);
+        BridgeSendEvent("CAST_SPELL_FAIL", buf);
+        ReportCastOrder("FAIL", reason);
+    }
+    m_playerOrder = PlayerCastOrder();
+}
+
+// The addon listens on CHAT_MSG_SYSTEM, so the outcome rides the same prefixed
+// system-message channel the spellbook dump uses. Silently no-ops when the
+// commander has logged out or left the group, which is the common case for an
+// order that expires long after the fact.
+void AiBotAI::ReportCastOrder(char const* verb, char const* detail)
+{
+    if (m_playerOrder.commanderGuid.IsEmpty())
+        return;
+
+    Player* pCommander = sObjectMgr.GetPlayer(m_playerOrder.commanderGuid);
+    if (!pCommander || !pCommander->IsInWorld() || !pCommander->GetSession())
+        return;
+
+    ChatHandler(pCommander).PSendSysMessage("MSUIBS|CAST|%s|%u|%s|%s",
+        me->GetName(), m_playerOrder.spellId, verb, detail ? detail : "");
+}
+
 bool AiBotAI::UpdateRotationSlate()
 {
     if (m_rotation.empty())

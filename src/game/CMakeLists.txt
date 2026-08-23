@@ -81,6 +81,7 @@ set (game_SRCS
     Chat/MasterPlayer.cpp
     Chat/MasterPlayerChat.cpp
     Commands/AccountCommands.cpp
+    Commands/BotSpellCommands.cpp
     Commands/CharacterCommands.cpp
     Commands/CreatureCommands.cpp
     Commands/DebugCommands.cpp

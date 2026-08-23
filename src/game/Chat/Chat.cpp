@@ -933,6 +933,18 @@ ChatCommand * ChatHandler::getCommandTable()
         { nullptr,          0,                  false, nullptr,                                        "", nullptr }
     };
 
+    // [BOTBAR] Player-facing bot spell control, backing the MSUI_BotBar addon.
+    // SEC_PLAYER by design — AuthorizeBotCommand in BotSpellCommands.cpp carries the
+    // whole security model (real session, AiBot, same group, not possessed, throttled),
+    // because the addon can always be bypassed by typing the command by hand.
+    static ChatCommand botSpellCommandTable[] =
+    {
+        { "list",           SEC_PLAYER,         false, &ChatHandler::HandleBotSpellListCommand,       "", nullptr },
+        { "cast",           SEC_PLAYER,         false, &ChatHandler::HandleBotSpellCastCommand,       "", nullptr },
+        { "stop",           SEC_PLAYER,         false, &ChatHandler::HandleBotSpellStopCommand,       "", nullptr },
+        { nullptr,          0,                  false, nullptr,                                       "", nullptr }
+    };
+
     static ChatCommand specCommandTable[] =
     {
         { "save",           SEC_PLAYER,         false, &ChatHandler::HandleSpecSaveCommand,           "", nullptr },
@@ -1234,6 +1246,7 @@ ChatCommand * ChatHandler::getCommandTable()
         { "reload",         SEC_DEVELOPER,      true, nullptr,                                         "", reloadCommandTable   },
         { "reset",          SEC_GAMEMASTER,     true, nullptr,                                         "", resetCommandTable    },
         { "spec",           SEC_PLAYER,     false, nullptr,                                       "", specCommandTable     },
+        { "botspell",       SEC_PLAYER,     false, nullptr,           "Command a grouped bot's spells", botSpellCommandTable },
         { "testbars",       SEC_GAMEMASTER,     false, &ChatHandler::HandleTestBarsCommand,           "", nullptr },
         { "server",         SEC_PLAYER,         true, nullptr,                                         "", serverCommandTable   },
         { "tele",           SEC_TICKETMASTER,   true, nullptr,                                         "", teleCommandTable     },
