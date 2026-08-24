@@ -1246,7 +1246,6 @@ ChatCommand * ChatHandler::getCommandTable()
         { "reload",         SEC_DEVELOPER,      true, nullptr,                                         "", reloadCommandTable   },
         { "reset",          SEC_GAMEMASTER,     true, nullptr,                                         "", resetCommandTable    },
         { "spec",           SEC_PLAYER,     false, nullptr,                                       "", specCommandTable     },
-        { "botspell",       SEC_PLAYER,     false, nullptr,           "Command a grouped bot's spells", botSpellCommandTable },
         { "testbars",       SEC_GAMEMASTER,     false, &ChatHandler::HandleTestBarsCommand,           "", nullptr },
         { "server",         SEC_PLAYER,         true, nullptr,                                         "", serverCommandTable   },
         { "tele",           SEC_TICKETMASTER,   true, nullptr,                                         "", teleCommandTable     },
@@ -1254,6 +1253,11 @@ ChatCommand * ChatHandler::getCommandTable()
         { "wp",             SEC_TICKETMASTER,   false, nullptr,                                        "", wpCommandTable       },
         { "service",        SEC_ADMINISTRATOR,  true, nullptr,                                         "", serviceCommandTable  },
         { "bot",            SEC_ADMINISTRATOR,  true, nullptr,                              "Manage bots", botCommandTable      },
+        // MUST stay after "bot": FindCommand takes the FIRST prefix match, so a longer
+        // name sharing a prefix has to follow the shorter one or it swallows it. Listed
+        // before "bot", this entry made ".bot addai" resolve to ".botspell addai" and
+        // broke every .bot command. Same rule as go/gobject, ban/bank, save/saveall.
+        { "botspell",       SEC_PLAYER,         false, nullptr,      "Command a grouped bot's spells", botSpellCommandTable },
         { "ahbot",          SEC_ADMINISTRATOR,  true, nullptr,                            "Manage AH bot", ahbotCommandTable    },
         { "partybot",       SEC_ADMINISTRATOR,  false, nullptr,                       "Manage party bots", partyBotCommandTable },
         { "battlebot",      SEC_ADMINISTRATOR,  true, nullptr,                      "Manage battle bots", battleBotCommandTable},
